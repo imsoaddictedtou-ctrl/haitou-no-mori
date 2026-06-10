@@ -1,0 +1,5 @@
+[client]
+showErrorDetails = "full"
+
+[browser]
+gatherUsageStats = false
