@@ -200,6 +200,52 @@ def get_dividend_from_yahoo_quote(code: str) -> float:
     return 0.0
 
 
+def get_price_yield_from_kabutan(code: str) -> dict:
+    """株探から株価・予想配当利回りを取得し、1株配当を逆算する。
+
+    IRBank・Yahoo Financeがクラウド環境（Streamlit Cloud等のAWS IP）から
+    ブロックされる場合のフォールバック。株探はクラウドからもアクセス可能。
+
+    Returns:
+        {'price': float, 'yield_pct': float, 'dividend': float}
+        取得失敗時は全て 0.0。
+    """
+    result = {'price': 0.0, 'yield_pct': 0.0, 'dividend': 0.0}
+    soup = _get(f"https://kabutan.jp/stock/?code={code}")
+    if soup is None:
+        return result
+
+    # 株価（<span class="kabuka">2,814.0円</span>）
+    price_el = soup.select_one('span.kabuka')
+    if price_el:
+        try:
+            result['price'] = float(
+                price_el.get_text(strip=True).replace('円', '').replace(',', '')
+            )
+        except ValueError:
+            pass
+
+    # PER/PBR/利回り/信用倍率テーブルから利回りを取得
+    for table in soup.find_all('table'):
+        ths = [th.get_text(strip=True) for th in table.find_all('th')]
+        if '利回り' in ths:
+            tds = [td.get_text(strip=True) for td in table.find_all('td')]
+            try:
+                idx = ths.index('利回り')
+                yield_str = tds[idx].replace('％', '').replace('%', '').strip()
+                if yield_str not in ('－', '-', ''):
+                    result['yield_pct'] = float(yield_str)
+            except (ValueError, IndexError):
+                pass
+            break
+
+    # 1株配当を逆算（株価 × 利回り）
+    if result['price'] > 0 and result['yield_pct'] > 0:
+        result['dividend'] = round(result['price'] * result['yield_pct'] / 100, 1)
+
+    return result
+
+
 def search_code(query: str) -> list[dict]:
     """社名・キーワードから証券コード候補リストを返す。"""
     soup = _get(f"{BASE_URL}/search?query={requests.utils.quote(query)}")
