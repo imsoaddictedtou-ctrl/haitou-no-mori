@@ -53,9 +53,9 @@ from screening_config import (
 from scraper import (
     get_dividends_from_results, get_sector,
     get_dividend_from_yahoo_quote, _parse_value,
-    get_category_stocks, IRBANK_CATEGORY_URLS,
     get_company_info, search_code,
     get_price_yield_from_kabutan,
+    get_category_stocks_kabutan, KABUTAN_INDUSTRY_NUM,
 )
 
 # ── セクタータイプ色定義 ──────────────────────────────────
@@ -1014,61 +1014,46 @@ EPS＝1株あたり利益。会社が「1株あたりいくら稼いだか」。
             with col_opt1:
                 n_per_sector   = st.number_input("業種ごとの取得上限", min_value=3, max_value=20, value=5, key="auto_n_pub")
             with col_opt2:
-                min_cap        = st.number_input("最低時価総額（億円）", min_value=100, max_value=5000, value=500, step=100, key="auto_cap_pub")
-            with col_opt3:
                 min_yield_auto = st.number_input("最低利回り（%）", min_value=2.0, max_value=6.0, value=3.5, step=0.1, key="auto_yield_pub")
+            with col_opt3:
+                st.markdown("<br>", unsafe_allow_html=True)
+                prime_only = st.checkbox("プライム市場のみ（大型株中心）", value=True, key="auto_prime_pub")
 
             owned_codes_auto = set(portfolio_df['code'].tolist()) if portfolio_df is not None else set()
             current_wl_codes = set(re.findall(r'\d{4}', st.session_state.get('watchlist_input', _DEFAULT_WATCHLIST)))
 
             if st.button("🔍 候補を自動取得", key="auto_fetch_pub"):
-                target_sectors = [
-                    s for s, t in SECTOR_TYPE_MAP.items()
-                    if t in lacking_types and s in IRBANK_CATEGORY_URLS
-                ]
-                fetch_bar     = st.progress(0, text="IRBankから業種別銘柄を取得中...")
+                # 不足タイプに属する業種を抽出（株探の業種番号で重複排除）
+                target_sectors = []
+                seen_nums = set()
+                for s, t in SECTOR_TYPE_MAP.items():
+                    num = KABUTAN_INDUSTRY_NUM.get(s)
+                    if t in lacking_types and num is not None and num not in seen_nums:
+                        target_sectors.append(s)
+                        seen_nums.add(num)
+
+                fetch_bar      = st.progress(0, text="株探から業種別銘柄を取得中...")
                 all_candidates = []
                 seen_codes     = set(current_wl_codes)
 
                 for idx, sector in enumerate(target_sectors):
                     fetch_bar.progress((idx + 1) / max(len(target_sectors), 1),
                                        text=f"取得中: {sector}")
-                    stocks = get_category_stocks(sector, min_market_cap_oku=min_cap)
-                    added  = 0
-                    for s in stocks:
+                    # 株探の業種ページは利回り付きの一覧（1業種2〜5リクエストで完結）
+                    stocks = get_category_stocks_kabutan(
+                        sector, min_yield=min_yield_auto,
+                        prime_only=prime_only, max_pages=5,
+                    )
+                    added = 0
+                    for s in stocks:   # 利回り降順で来る
                         if added >= n_per_sector:
                             break
                         code = s['code']
                         if code in owned_codes_auto or code in seen_codes:
                             continue
-
-                        info      = get_company_info(code)
-                        price_str = str(info.get('stock_price', '')).replace('円','').replace(',','').strip()
-                        try:
-                            price_val = float(price_str)
-                        except ValueError:
-                            price_val = None
-
-                        yld_str = info.get('dividend_yield', '')
-                        try:
-                            yld = float(str(yld_str).replace('%',''))
-                        except ValueError:
-                            yld = 0.0
-
-                        if yld == 0.0:
-                            yahoo_div = get_dividend_from_yahoo_quote(code)
-                            if yahoo_div > 0 and price_val and price_val > 0:
-                                yld     = round(yahoo_div / price_val * 100, 2)
-                                yld_str = f"{yld:.2f}% ⚠️"
-
-                        if yld < min_yield_auto:
-                            time.sleep(0.2)
-                            continue
-
-                        all_candidates.append({**s, 'yield_pct': yld, 'yield_str': yld_str})
+                        all_candidates.append({**s, 'yield_str': f"{s['yield_pct']:.2f}%"})
                         seen_codes.add(code)
                         added += 1
-                        time.sleep(0.3)
 
                 fetch_bar.empty()
 
