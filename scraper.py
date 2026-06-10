@@ -1,4 +1,5 @@
 import re
+import time
 import requests
 from bs4 import BeautifulSoup
 
@@ -247,33 +248,45 @@ def get_price_yield_from_kabutan(code: str) -> dict:
 
 
 def search_code(query: str) -> list[dict]:
-    """社名・キーワードから証券コード候補リストを返す。"""
+    """社名・キーワードから証券コード候補リストを返す。
+    IRBank検索 → Yahoo Finance検索の順でフォールバック。
+    """
     soup = _get(f"{BASE_URL}/search?query={requests.utils.quote(query)}")
-    if soup is None:
-        return []
-
     candidates = []
-    seen = set()
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        code = href.strip("/")
-        if re.fullmatch(r"\d{4}", code) and code not in seen:
-            name = a.get_text(strip=True)
-            if name:
-                candidates.append({"code": code, "name": name})
-                seen.add(code)
+    if soup is not None:
+        seen = set()
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            code = href.strip("/")
+            if re.fullmatch(r"\d{4}", code) and code not in seen:
+                name = a.get_text(strip=True)
+                if name:
+                    candidates.append({"code": code, "name": name})
+                    seen.add(code)
+
+    # IRBankが使えない環境（クラウド等）→ Yahoo Finance検索
+    if not candidates:
+        candidates = search_code_yahoo(query)
     return candidates
 
 
 def get_company_info(code: str) -> dict:
-    """企業名・株価・各種指標を取得する。"""
+    """企業名・株価・各種指標を取得する。
+    IRBank → 株探の順でフォールバック（クラウド環境対応）。
+    """
     soup = _get(f"{BASE_URL}/{code}")
     if soup is None:
-        return {"listed": False}
+        return get_company_info_kabutan(code)
 
     title = soup.title.get_text(strip=True) if soup.title else ""
     if "NOT FOUND" in title or "404" in title:
         return {"listed": False}
+    # IRBankブロック時（CloudFrontエラーページ等）は株探へ
+    # 正常時のタイトルは「7203 トヨタ自動車 | 株式情報」のようにコードを含む
+    if code not in title:
+        kabutan_info = get_company_info_kabutan(code)
+        if kabutan_info.get("listed"):
+            return kabutan_info
 
     company_name = "不明"
     if title:
@@ -351,10 +364,12 @@ def get_company_info(code: str) -> dict:
 
 
 def get_results(code: str) -> list[dict]:
-    """売上高・営業利益・純利益・EPSの年次推移（最大15年）を取得する。"""
+    """売上高・営業利益・純利益・EPSの年次推移（最大15年）を取得する。
+    IRBank → 株探の順でフォールバック（クラウド環境対応）。
+    """
     soup = _get(f"{BASE_URL}/{code}/results")
     if soup is None:
-        return []
+        return get_results_kabutan(code)
 
     # ヘッダー名→列インデックスのマッピング候補（優先順に記載・完全一致優先）
     COL_KEYS = {
@@ -416,14 +431,20 @@ def get_results(code: str) -> list[dict]:
                 "roe":        _cell("roe"),
             })
         break
+
+    # IRBankブロック時（テーブルが見つからない）→ 株探
+    if not results:
+        results = get_results_kabutan(code)
     return results
 
 
 def get_dividends_from_results(code: str) -> list[dict]:
-    """業績ページの一株配当列から配当金推移を取得する（株式分割調整済み）。"""
+    """業績ページの一株配当列から配当金推移を取得する（株式分割調整済み）。
+    IRBank → 株探の順でフォールバック（クラウド環境対応）。
+    """
     soup = _get(f"{BASE_URL}/{code}/results")
     if soup is None:
-        return []
+        return get_dividends_from_results_kabutan(code)
 
     dividends = []
     for table in soup.find_all("table"):
@@ -466,6 +487,12 @@ def get_dividends_from_results(code: str) -> list[dict]:
                 "yield":   "不明",
             })
         break
+
+    # IRBankブロック時（テーブルなし or 全行「不明」）→ 株探
+    if not dividends or all(d["total"] == "不明" for d in dividends):
+        kabutan_divs = get_dividends_from_results_kabutan(code)
+        if kabutan_divs:
+            return kabutan_divs
     return dividends
 
 
@@ -846,3 +873,284 @@ def _parse_cap(text: str) -> float | None:
     if m_oku:
         val += float(m_oku.group(1).replace(',', ''))
     return val if val > 0 else None
+
+
+# ── 株探 業種別銘柄リスト ─────────────────────────────────
+# IRBankがクラウド環境（Streamlit Cloud等）からブロックされるため、
+# 業種別の候補取得は株探をプライマリとして使う。
+# kabutan.jp/themes/?industry=N の業種番号マッピング（東証33業種）
+KABUTAN_INDUSTRY_NUM: dict[str, int] = {
+    '水産・農林業': 1,  '鉱業': 2,        '建設業': 3,      '食料品': 4,
+    '繊維製品': 5,      'パルプ・紙': 6,  '化学': 7,        '医薬品': 8,
+    '石油・石炭': 9,    'ゴム製品': 10,   'ガラス・土石': 11, '鉄鋼': 12,
+    '非鉄金属': 13,     '金属製品': 14,   '機械': 15,       '電気機器': 16,
+    '輸送用機器': 17,   '精密機器': 18,   'その他製品': 19,  '電気・ガス': 20,
+    '陸運業': 21,       '海運業': 22,     '空運業': 23,     '倉庫・運輸': 24,
+    '情報・通信業': 25, '卸売業': 26,     '小売業': 27,     '銀行業': 28,
+    '証券・商品': 29,   '保険業': 30,     'その他金融業': 31, '不動産業': 32,
+    'サービス業': 33,
+    # SECTOR_TYPE_MAP側の表記ゆれエイリアス
+    '電気・ガス業': 20,
+    '石油・石炭製品': 9,
+    'ガラス・土石製品': 11,
+    '窯業・土石製品': 11,
+    '倉庫・運輸関連業': 24,
+    '証券、商品先物取引業': 29,
+    '証券業': 29,
+    '通信業': 25,
+    '小売': 27,
+}
+
+
+def get_category_stocks_kabutan(sector_name: str, min_yield: float = 0.0,
+                                prime_only: bool = True,
+                                max_pages: int = 5) -> list[dict]:
+    """
+    株探の業種別ページから銘柄一覧（利回り付き）を取得する。
+
+    1リクエストで複数銘柄の利回りが取れるため、IRBank方式
+    （銘柄ごとに個別ページを取得）より高速かつクラウド対応。
+
+    Parameters
+    ----------
+    sector_name : 業種名（例: '食料品'）
+    min_yield   : 最低配当利回り%。これ未満は除外。
+    prime_only  : Trueなら東証プライム銘柄のみ（大型株中心）
+    max_pages   : 取得する最大ページ数（1ページ約15銘柄）
+
+    Returns
+    -------
+    [{'code', 'name', 'sector', 'market', 'price', 'yield_pct'}, ...]
+    利回り降順でソート済み。
+    """
+    num = KABUTAN_INDUSTRY_NUM.get(sector_name)
+    if num is None:
+        return []
+
+    results = []
+    for page in range(1, max_pages + 1):
+        soup = _get(f"https://kabutan.jp/themes/?industry={num}&page={page}")
+        if soup is None:
+            break
+
+        table = None
+        for t in soup.find_all('table'):
+            ths = [th.get_text(strip=True) for th in t.find_all('th')]
+            if 'コード' in ths and '利回り' in ths:
+                table = t
+                break
+        if table is None:
+            break
+
+        found_in_page = 0
+        for tr in table.find_all('tr')[1:]:
+            cells = tr.find_all(['td', 'th'])
+            if len(cells) < 13:
+                continue
+            code = cells[0].get_text(strip=True)
+            if not re.fullmatch(r'\d{4}', code):
+                continue   # 4桁コード以外（英字入り等）はスキップ
+            found_in_page += 1
+
+            market = cells[2].get_text(strip=True)
+            if prime_only and 'Ｐ' not in market:
+                continue
+
+            def _f(s):
+                s = s.replace(',', '').replace('％', '').replace('%', '').strip()
+                try:
+                    return float(s)
+                except ValueError:
+                    return None
+
+            price     = _f(cells[5].get_text(strip=True))
+            yield_pct = _f(cells[12].get_text(strip=True))
+
+            if yield_pct is None or yield_pct < min_yield:
+                continue
+
+            results.append({
+                'code':      code,
+                'name':      cells[1].get_text(strip=True),
+                'sector':    sector_name,
+                'market':    market,
+                'price':     price,
+                'yield_pct': yield_pct,
+            })
+
+        if found_in_page == 0:
+            break   # 最終ページ到達
+        time.sleep(0.3)
+
+    results.sort(key=lambda x: x['yield_pct'], reverse=True)
+    return results
+
+
+# ── 株探フォールバック（IRBankクラウドブロック対策） ──────
+def _kabutan_finance_data(code: str) -> dict:
+    """株探の決算ページから通期業績と財務指標を取得する。
+
+    Returns:
+        {'results': [{'year','revenue','op_profit','net_profit','eps','dividend'}...],
+         'equity_ratio': '61.6%' or '不明'}
+    """
+    out = {'results': [], 'equity_ratio': '不明'}
+    soup = _get(f"https://kabutan.jp/stock/finance?code={code}")
+    if soup is None:
+        return out
+
+    def _oku_str(s: str) -> str:
+        """百万円表記 '314,312' → '3143.1億'。パース不可なら'不明'"""
+        s = s.replace(',', '').replace('－', '').strip()
+        try:
+            oku = float(s) / 100   # 百万円→億円
+            return f"{oku:.1f}億"
+        except ValueError:
+            return '不明'
+
+    # 通期業績テーブル（決算期/売上高/営業益/.../修正1株益/修正1株配）
+    for t in soup.find_all('table'):
+        ths = [th.get_text(strip=True) for th in t.find_all('th')]
+        if '修正1株益' in ths and '決算期' in ths:
+            for tr in t.find_all('tr')[1:]:
+                cells = [c.get_text(strip=True) for c in tr.find_all(['th', 'td'])]
+                if len(cells) < 7 or not re.match(r'\d{4}\.\d{2}', cells[0]):
+                    continue
+                out['results'].append({
+                    'year':       cells[0].replace('.', '/'),
+                    'revenue':    _oku_str(cells[1]),
+                    'op_profit':  _oku_str(cells[2]),
+                    'net_profit': _oku_str(cells[4]),
+                    'eps':        cells[5].replace(',', '') or '不明',
+                    'roe':        '不明',
+                    'dividend':   cells[6].replace(',', '') or '不明',
+                })
+            break
+
+    # 財務テーブルから自己資本比率（最新行）
+    for t in soup.find_all('table'):
+        ths = [th.get_text(strip=True) for th in t.find_all('th')]
+        if '自己資本比率' in ths and '決算期' in ths:
+            try:
+                idx = ths.index('自己資本比率')
+                last_val = None
+                for tr in t.find_all('tr')[1:]:
+                    cells = [c.get_text(strip=True) for c in tr.find_all(['th', 'td'])]
+                    if len(cells) > idx and re.match(r'\d{4}\.\d{2}', cells[0]):
+                        v = cells[idx].replace('％', '').replace('%', '').strip()
+                        if v and v not in ('－', '-'):
+                            last_val = v
+                if last_val:
+                    out['equity_ratio'] = last_val + '%'
+            except (ValueError, IndexError):
+                pass
+            break
+
+    return out
+
+
+def get_results_kabutan(code: str) -> list[dict]:
+    """株探版 get_results。IRBankと同じ形式で返す。"""
+    data = _kabutan_finance_data(code)
+    return [
+        {k: r[k] for k in ('year', 'revenue', 'op_profit', 'net_profit', 'eps', 'roe')}
+        for r in data['results']
+    ]
+
+
+def get_dividends_from_results_kabutan(code: str) -> list[dict]:
+    """株探版 配当推移。IRBankのget_dividends_from_resultsと同形式。"""
+    data = _kabutan_finance_data(code)
+    return [
+        {
+            'year':    r['year'],
+            'type':    '本決算',
+            'interim': '不明',
+            'yearend': '不明',
+            'total':   r['dividend'],
+            'yield':   '不明',
+        }
+        for r in data['results']
+    ]
+
+
+def get_company_info_kabutan(code: str) -> dict:
+    """株探版 get_company_info。トップページ＋決算ページの2リクエスト。"""
+    soup = _get(f"https://kabutan.jp/stock/?code={code}")
+    if soup is None:
+        return {'listed': False}
+
+    title = soup.title.get_text(strip=True) if soup.title else ''
+    m = re.match(r'(.+?)【', title)
+    company_name = m.group(1).strip() if m else '不明'
+    if company_name == '不明' or '株探' == company_name:
+        return {'listed': False}
+
+    info = {
+        'listed': True, 'company_name': company_name, 'code': code,
+        'stock_price': '不明', 'dividend_yield': '不明', 'dividend_amount': '不明',
+        'per': '不明', 'pbr': '不明', 'roe': '不明', 'eps': '不明', 'bps': '不明',
+        'equity_ratio': '不明', 'market_cap': '不明',
+    }
+
+    price_el = soup.select_one('span.kabuka')
+    if price_el:
+        info['stock_price'] = price_el.get_text(strip=True)
+
+    for table in soup.find_all('table'):
+        # 全角/半角どちらの表記にも対応するため正規化して照合
+        ths_raw = [th.get_text(strip=True) for th in table.find_all('th')]
+        _norm = str.maketrans('ＰＥＲＢ％', 'PERB%')
+        ths = [h.translate(_norm) for h in ths_raw]
+        if '利回り' in ths and 'PER' in ths:
+            tds = [td.get_text(strip=True) for td in table.find_all('td')]
+
+            def _v(col):
+                try:
+                    i = ths.index(col)
+                    return tds[i] if i < len(tds) else '不明'
+                except ValueError:
+                    return '不明'
+
+            per = _v('PER').replace('倍', '')
+            if per not in ('－', '-', '', '不明'):
+                info['per'] = per + '倍'
+            pbr = _v('PBR').replace('倍', '')
+            if pbr not in ('－', '-', '', '不明'):
+                info['pbr'] = pbr + '倍'
+            yld = _v('利回り').translate(_norm).replace('%', '')
+            if yld not in ('－', '-', '', '不明'):
+                info['dividend_yield'] = yld + '%'
+            cap = _v('時価総額')
+            if cap not in ('－', '-', '', '不明'):
+                info['market_cap'] = cap.replace('円', '')
+            break
+
+    # 自己資本比率は決算ページから
+    fin = _kabutan_finance_data(code)
+    info['equity_ratio'] = fin['equity_ratio']
+    return info
+
+
+def search_code_yahoo(query: str) -> list[dict]:
+    """Yahoo Finance検索版 search_code。IRBank検索が使えない環境向け。"""
+    soup = _get(f"https://finance.yahoo.co.jp/search/?query={requests.utils.quote(query)}")
+    if soup is None:
+        return []
+    candidates, seen = [], set()
+    for a in soup.find_all('a', href=True):
+        m = re.search(r'/quote/(\d{4})\.T', a['href'])
+        if not m:
+            continue
+        code = m.group(1)
+        name = a.get_text(strip=True)
+        # ナビリンク（チャート・時系列等）を除外し、社名らしいテキストのみ採用
+        if code in seen or not name or name in ('チャート', '時系列', 'ニュース', '掲示板', '企業情報'):
+            continue
+        # 「5970東証PRM(株)ジーテクト2,091-11」のような連結テキストから社名を抽出
+        m2 = re.search(r'(?:\(株\)|（株）)?([^\d(（]+)', name.replace(code, '').replace('東証PRM', '').replace('東証STD', '').replace('東証GRT', ''))
+        clean = m2.group(1).strip() if m2 else name
+        if clean:
+            candidates.append({'code': code, 'name': clean})
+            seen.add(code)
+    return candidates
