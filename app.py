@@ -181,8 +181,10 @@ def parse_rakuten_csv(file) -> pd.DataFrame:
             row.get('銘柄コード') or
             cols[0]
         ).strip().strip('"')
-        code = raw_code.translate(str.maketrans('０１２３４５６７８９', '0123456789'))
-        if re.fullmatch(r'\d{4}', code):
+        code = raw_code.translate(str.maketrans(
+            '０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ',
+            '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ')).upper()
+        if re.fullmatch(r'\d{3}[0-9A-Z]', code):
             row['_code'] = code
             row['_account'] = current_account
             rows.append(row)
@@ -263,7 +265,7 @@ def parse_simple_csv(file) -> pd.DataFrame:
         # コード列が4桁数字かチェック
         if 'code' in df.columns:
             df['code'] = df['code'].astype(str).str.strip()
-            df = df[df['code'].str.fullmatch(r'\d{4}')]
+            df = df[df['code'].str.fullmatch(r'\d{3}[0-9A-Z]')]
             if not df.empty:
                 return df
     except Exception:
@@ -934,9 +936,9 @@ EPS＝1株あたり利益。会社が「1株あたりいくら稼いだか」。
             do_search = st.button("🔍 検索", key="do_search_pub")
 
         if do_search and search_query.strip():
-            q = search_query.strip()
+            q = search_query.strip().upper()   # 285a → 285A（新形式コード対応）
             with st.spinner("検索中…"):
-                if re.fullmatch(r'\d{4}', q):
+                if re.fullmatch(r'\d{3}[0-9A-Z]', q):
                     info = get_company_info(q)
                     found = [{'code': q, 'name': info.get('company_name', '不明')}]
                 else:
@@ -948,7 +950,7 @@ EPS＝1株あたり利益。会社が「1株あたりいくら稼いだか」。
         # 検索結果はセッションに保持（追加ボタンのrerunで消えないように）
         for item in st.session_state.get('search_results_pub', [])[:5]:
             c, n = item['code'], item['name']
-            existing = re.findall(r'\d{4}', codes_text)
+            existing = re.findall(r'\d{3}[0-9A-Z]', codes_text.upper())
             if c not in existing:
                 if st.button(f"➕ {c} {n[:20]} をウォッチリストに追加", key=f"add_search_{c}"):
                     st.session_state['_pending_watchlist'] = codes_text.rstrip() + f"\n{c}"
@@ -1020,7 +1022,7 @@ EPS＝1株あたり利益。会社が「1株あたりいくら稼いだか」。
                 prime_only = st.checkbox("プライム市場のみ（大型株中心）", value=True, key="auto_prime_pub")
 
             owned_codes_auto = set(portfolio_df['code'].tolist()) if portfolio_df is not None else set()
-            current_wl_codes = set(re.findall(r'\d{4}', st.session_state.get('watchlist_input', _DEFAULT_WATCHLIST)))
+            current_wl_codes = set(re.findall(r'\d{3}[0-9A-Z]', st.session_state.get('watchlist_input', _DEFAULT_WATCHLIST).upper()))
 
             if st.button("🔍 候補を自動取得", key="auto_fetch_pub"):
                 # 不足タイプに属する業種を抽出（株探の業種番号で重複排除）
@@ -1086,7 +1088,7 @@ EPS＝1株あたり利益。会社が「1株あたりいくら稼いだか」。
                     st.caption("☝️ 追加したい銘柄にチェックを入れてください")
 
     # ── スキャン実行 ──────────────────────────────────────
-    raw_codes = re.findall(r'\d{4}', st.session_state.get('watchlist_input', _DEFAULT_WATCHLIST))
+    raw_codes = re.findall(r'\d{3}[0-9A-Z]', st.session_state.get('watchlist_input', _DEFAULT_WATCHLIST).upper())
     unique_codes = list(dict.fromkeys(raw_codes))
 
     st.markdown(f"**ウォッチリスト：{len(unique_codes)} 銘柄**")
