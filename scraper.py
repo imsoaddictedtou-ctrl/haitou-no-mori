@@ -258,7 +258,7 @@ def search_code(query: str) -> list[dict]:
         for a in soup.find_all("a", href=True):
             href = a["href"]
             code = href.strip("/")
-            if re.fullmatch(r"\d{4}", code) and code not in seen:
+            if re.fullmatch(r"\d{3}[0-9A-Z]", code) and code not in seen:
                 name = a.get_text(strip=True)
                 if name:
                     candidates.append({"code": code, "name": name})
@@ -686,9 +686,14 @@ def scrape_all(query: str) -> dict:
     """
     query = query.strip()
     # 全角数字・スペースを半角に変換
-    query = query.translate(str.maketrans("０１２３４５６７８９　", "0123456789 ")).strip()
+    query = query.translate(str.maketrans(
+        "０１２３４５６７８９　ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ",
+        "0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ")).strip()
+    # 新形式コード（285A等）の小文字入力に対応
+    if re.fullmatch(r"\d{3}[0-9A-Za-z]", query):
+        query = query.upper()
 
-    if re.fullmatch(r"\d{4}", query):
+    if re.fullmatch(r"\d{3}[0-9A-Z]", query):
         code = query
     else:
         candidates = search_code(query)
@@ -826,13 +831,13 @@ def get_category_stocks(sector_name: str, min_market_cap_oku: float = 500.0) -> 
         code = ''
         if link:
             href = link.get('href', '')
-            m = re.search(r'/(\d{4})', href)
+            m = re.search(r'/(\d{3}[0-9A-Z])', href)
             if m:
                 code = m.group(1)
         if not code:
             # No.列と会社名列から取得
             raw_code = cells[0].get_text(strip=True)
-            m = re.search(r'(\d{4})', raw_code)
+            m = re.search(r'(\d{3}[0-9A-Z])', raw_code)
             if m:
                 code = m.group(1)
 
@@ -948,7 +953,7 @@ def get_category_stocks_kabutan(sector_name: str, min_yield: float = 0.0,
             if len(cells) < 13:
                 continue
             code = cells[0].get_text(strip=True)
-            if not re.fullmatch(r'\d{4}', code):
+            if not re.fullmatch(r'\d{3}[0-9A-Z]', code):
                 continue   # 4桁コード以外（英字入り等）はスキップ
             found_in_page += 1
 
@@ -1139,7 +1144,7 @@ def search_code_yahoo(query: str) -> list[dict]:
         return []
     candidates, seen = [], set()
     for a in soup.find_all('a', href=True):
-        m = re.search(r'/quote/(\d{4})\.T', a['href'])
+        m = re.search(r'/quote/(\d{3}[0-9A-Z])\.T', a['href'])
         if not m:
             continue
         code = m.group(1)
