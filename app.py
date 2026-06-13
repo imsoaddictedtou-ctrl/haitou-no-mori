@@ -693,7 +693,7 @@ def render_portfolio_tab() -> None:
         top = top[top['annual_dividend'] > 0]
         if not top.empty:
             top = top.copy()
-            top['label'] = top['code'] + ' ' + top['name'].str[:10]
+            top['label'] = top['code'].astype(str) + ' ' + top['name'].astype(str).str[:10]
             fig = go.Figure(go.Bar(
                 x=top['annual_dividend'], y=top['label'],
                 orientation='h', marker_color='#1a6b9e',
