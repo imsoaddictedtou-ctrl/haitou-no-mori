@@ -20,6 +20,7 @@ import sys
 import io
 import time
 import re
+import unicodedata
 import csv as csv_module
 import json
 from pathlib import Path
@@ -66,14 +67,17 @@ SECTOR_TYPE_COLOR = {
     '不明':           '#AAAAAA',
 }
 
+# ── 外部リンク設定（URLを変更するだけで更新可） ──────────────
+_KOUAPP_URL = "https://kouapp-ciwffqgdtrzsx5fgvfs9bf.streamlit.app/"
+
 # ── ページ設定 ────────────────────────────────────────────
 from PIL import Image
-_icon_path   = _HERE / "icon.png"
+_icon_path   = _HERE / "logo_chicken.png"
 _illust_path = _HERE / "kou_illust.png"
 _page_icon   = Image.open(_icon_path) if _icon_path.exists() else "💎"
 
 st.set_page_config(
-    page_title="配当の森 〜育てる高配当株ダッシュボード〜",
+    page_title="金の卵を産む鶏 〜育てる高配当株ダッシュボード〜",
     page_icon=_page_icon,
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -81,10 +85,22 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-[data-testid="stMetricValue"]  { font-size: 1.7rem !important; font-weight: 700; }
-[data-testid="stMetricLabel"]  { font-size: 0.85rem !important; color: #888; }
-[data-testid="stMetricDelta"]  { font-size: 0.95rem !important; }
+/* ── KPIカード ── */
+[data-testid="stMetricValue"]  { font-size: 1.9rem !important; font-weight: 700; }
+[data-testid="stMetricLabel"]  { font-size: 0.95rem !important; color: #888; }
+[data-testid="stMetricDelta"]  { font-size: 1.0rem !important; }
+/* ── テーブル ── */
+[data-testid="stDataFrame"] table { font-size: 0.95rem !important; }
+[data-testid="stDataFrame"] thead th { font-size: 0.9rem !important; font-weight: 600; }
+/* ── タブ ── */
+button[data-baseweb="tab"] { font-size: 1.0rem !important; font-weight: 600; }
+/* ── caption ── */
+[data-testid="stCaptionContainer"] { font-size: 0.88rem !important; }
+/* ── 本文 ── */
+[data-testid="stMarkdownContainer"] p { font-size: 1.0rem !important; line-height: 1.65; }
+/* ── アップローダー ── */
 div[data-testid="stFileUploaderDropzone"] { border: 2px dashed #1a6b9e !important; border-radius: 12px !important; }
+/* ── ボタン ── */
 button[kind="primary"] { background-color: #1a6b9e !important; border-color: #1a6b9e !important; }
 button[kind="primary"]:hover { background-color: #155a87 !important; border-color: #155a87 !important; }
 </style>
@@ -141,6 +157,12 @@ def _restore_persisted() -> None:
         wl = ls.getItem("haitou_wl")
         if wl and 'watchlist_input' not in st.session_state:
             st.session_state['watchlist_input'] = wl
+        wl_names = ls.getItem("haitou_wl_names")
+        if wl_names and '_wl_names' not in st.session_state:
+            try:
+                st.session_state['_wl_names'] = json.loads(wl_names)
+            except Exception:
+                pass
         goal = ls.getItem("haitou_goal")
         if goal:
             try:
@@ -151,6 +173,15 @@ def _restore_persisted() -> None:
         if pf and 'portfolio_df' not in st.session_state:
             try:
                 st.session_state['portfolio_df'] = pd.read_json(io.StringIO(pf), orient='split')
+            except Exception:
+                pass
+        loaded_at = ls.getItem("haitou_loaded_at")
+        if loaded_at and 'portfolio_loaded_at' not in st.session_state:
+            st.session_state['portfolio_loaded_at'] = loaded_at
+        cal = ls.getItem("haitou_calendar")
+        if cal and '_fiscal_month' not in st.session_state:
+            try:
+                st.session_state['_fiscal_month'] = json.loads(cal)
             except Exception:
                 pass
     except Exception:
@@ -437,6 +468,29 @@ def build_portfolio(df: pd.DataFrame, progress_bar=None) -> pd.DataFrame:
     return df
 
 
+def update_prices(df: pd.DataFrame) -> pd.DataFrame:
+    """株探から最新株価を取得して current_price / market_value / profit / yield_current を更新する。"""
+    df = df.copy()
+    codes = df['code'].tolist()
+    prog = st.progress(0, text="株価を更新中…")
+    for i, code in enumerate(codes):
+        prog.progress((i + 1) / len(codes), text=f"{code} の株価を取得中… ({i+1}/{len(codes)})")
+        try:
+            kb = get_price_yield_from_kabutan(str(code))
+            price = kb.get('price', 0) or 0
+            if price > 0:
+                mask = df['code'].astype(str) == str(code)
+                df.loc[mask, 'current_price'] = price
+                df.loc[mask, 'market_value']  = price * df.loc[mask, 'shares']
+                df.loc[mask, 'profit']         = df.loc[mask, 'market_value'] - df.loc[mask, 'purchase_value']
+        except Exception:
+            pass
+    prog.empty()
+    df['yield_current'] = df.apply(
+        lambda r: r['annual_dividend'] / r['market_value'] * 100 if r['market_value'] > 0 else 0, axis=1)
+    return df
+
+
 # ═══════════════════════════════════════════════════════
 #  高配当戦略アドバイス
 # ═══════════════════════════════════════════════════════
@@ -583,6 +637,11 @@ def render_portfolio_tab() -> None:
                     built_df = build_portfolio(base_df, progress_bar=progress)
                     progress.progress(1.0, text="取得完了！")
                     st.session_state['portfolio_df'] = built_df
+                    loaded_at = datetime.now().strftime('%Y年%m月%d日 %H:%M')
+                    st.session_state['portfolio_loaded_at'] = loaded_at
+                    _persist("haitou_loaded_at", loaded_at)
+                    # 銘柄が変わったらカレンダーキャッシュをクリア
+                    st.session_state.pop('_fiscal_month', None)
                     df = built_df   # 同一スクリプト実行内でそのまま表示へ進む
                     st.success(f"✅ {len(df)}銘柄のデータを読み込みました")
             else:
@@ -602,7 +661,7 @@ def render_portfolio_tab() -> None:
     export_df = df[[c for c in export_cols if c in df.columns]].copy()
     csv_bytes = export_df.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
 
-    col_save, col_goal, col_reset = st.columns([3, 2, 2])
+    col_save, col_goal, col_refresh, col_reset = st.columns([3, 2, 2, 2])
     with col_save:
         st.download_button(
             "💾 保有データを保存（CSV）",
@@ -620,6 +679,17 @@ def render_portfolio_tab() -> None:
         if new_goal != get_goal():
             st.session_state['goal_stocks'] = int(new_goal)
         _persist("haitou_goal", str(int(new_goal)))
+    with col_refresh:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🔄 株価を最新に更新", key="refresh_prices_btn",
+                     help="株探から全銘柄の最新株価を取得します（1銘柄あたり約1秒）"):
+            updated_df = update_prices(df)
+            updated_at = datetime.now().strftime('%Y年%m月%d日 %H:%M')
+            st.session_state['portfolio_df'] = updated_df
+            st.session_state['price_updated_at'] = updated_at
+            _persist("haitou_portfolio", updated_df.to_json(orient='split'))
+            _persist("haitou_loaded_at", updated_at)
+            st.rerun()
     with col_reset:
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("🗑️ データをクリア"):
@@ -638,7 +708,9 @@ def render_portfolio_tab() -> None:
     # ポートフォリオをブラウザに自動保存（次回開いたとき復元される）
     try:
         _persist("haitou_portfolio", df.to_json(orient='split'))
-        st.caption("🔖 このポートフォリオはお使いのブラウザに自動保存されました（次回開くと復元されます）")
+        _price_ts = st.session_state.get('price_updated_at') or st.session_state.get('portfolio_loaded_at', '')
+        _ts_label = f"株価最終更新：{_price_ts}" if _price_ts else "CSVダウンロード時の株価を表示中"
+        st.caption(f"🔖 自動保存済み（次回開くと復元されます）　｜　📅 {_ts_label}")
     except Exception:
         pass
 
@@ -713,19 +785,25 @@ def render_portfolio_tab() -> None:
 
     # ── 保有銘柄一覧テーブル ──────────────────────────────
     st.subheader("📋 保有銘柄一覧")
+    loaded_at = st.session_state.get('portfolio_loaded_at', '')
+    if loaded_at:
+        st.caption(f"📅 データ読み込み日時：{loaded_at}　※株価・評価額は楽天証券CSVをダウンロードした時点の値です")
     # 旧バージョンの保存データには新列がないため補完
     _df = df.copy()
     if 'sector_type' not in _df.columns:
         _df['sector_type'] = '不明'
     if 'div_source' not in _df.columns:
         _df['div_source'] = '—'
+    # 損益変化率を事前計算
+    _df['_profit_pct'] = _df.apply(
+        lambda r: r['profit'] / r['purchase_value'] * 100 if r.get('purchase_value', 0) > 0 else 0, axis=1)
     disp = _df[['code', 'name', 'sector', 'sector_type', 'account', 'shares',
                 'cost_price', 'purchase_value', 'current_price', 'market_value',
                 'profit', 'dividend_per_share', 'div_source', 'annual_dividend',
                 'yield_current', 'yield_cost']].copy()
     disp.columns = ['コード', '銘柄名', '業種', 'タイプ', '口座', '保有数',
                     '取得単価', '購入額', '株価', '評価額',
-                    '損益（円）', '配当金単価', '配当データ', '年間配当金',
+                    '損益', '配当金単価', '配当データ', '年間配当金',
                     '利回り(時価)%', '利回り(簿価)%']
     disp['保有数']     = disp['保有数'].apply(lambda v: f'{int(v):,}')
     disp['取得単価']   = disp['取得単価'].apply(lambda v: f'{v:,.1f}')
@@ -733,7 +811,10 @@ def render_portfolio_tab() -> None:
     disp['配当金単価'] = disp['配当金単価'].apply(lambda v: f'{v:,.1f}')
     for col in ['購入額', '評価額', '年間配当金']:
         disp[col] = disp[col].apply(lambda v: f'{v:,.0f}')
-    disp['損益（円）'] = disp['損益（円）'].apply(lambda v: f'{v:+,.0f}')
+    disp['損益'] = [
+        f"{p:+,.0f} ({pct:+.1f}%)"
+        for p, pct in zip(_df['profit'], _df['_profit_pct'])
+    ]
     for col in ['利回り(時価)%', '利回り(簿価)%']:
         disp[col] = disp[col].apply(lambda v: f'{v:.2f}%')
 
@@ -930,6 +1011,46 @@ def recompute_results(results: list[dict], w: dict) -> list[dict]:
 _DEFAULT_WATCHLIST = ""   # 初期状態は空欄（各自で銘柄を追加してもらう）
 
 
+def _wl_codes() -> list[str]:
+    """ウォッチリストの証券コードを重複なしリストで返す。"""
+    txt = st.session_state.get('watchlist_input', _DEFAULT_WATCHLIST)
+    return list(dict.fromkeys(re.findall(r'\d{3}[0-9A-Z]', txt.upper())))
+
+
+def _set_wl_codes(codes: list[str]) -> None:
+    """コードのリストからウォッチリスト文字列を再構築して保存する。"""
+    st.session_state['_pending_watchlist'] = ",".join(dict.fromkeys(codes))
+
+
+def _wl_name_cache() -> dict:
+    return st.session_state.setdefault('_wl_names', {})
+
+
+def ensure_wl_names(codes: list[str]) -> dict:
+    """ウォッチリスト各コードの会社名を取得してキャッシュ＆永続化する。
+    取得済みはスキップ。失敗は空文字でキャッシュして再取得を防ぐ。
+    """
+    cache = _wl_name_cache()
+    missing = [c for c in codes if c not in cache]
+    if not missing:
+        return cache
+    prog = st.progress(0, text="会社名を取得中…")
+    for i, code in enumerate(missing):
+        prog.progress((i + 1) / len(missing), text=f"{code} の会社名を取得中… ({i+1}/{len(missing)})")
+        try:
+            info = get_company_info(code)
+            cache[code] = info.get('company_name', '') or ''
+        except Exception:
+            cache[code] = ''
+    prog.empty()
+    st.session_state['_wl_names'] = cache
+    try:
+        _persist("haitou_wl_names", json.dumps(cache, ensure_ascii=False))
+    except Exception:
+        pass
+    return cache
+
+
 def render_screening_tab() -> None:
 
     # ── スコア定義・配点カスタマイズ ──────────────────────
@@ -1046,18 +1167,9 @@ EPS＝1株あたり利益。会社が「1株あたりいくら稼いだか」。
     if 'watchlist_input' not in st.session_state:
         st.session_state['watchlist_input'] = _DEFAULT_WATCHLIST
 
-    with st.expander("📋 ウォッチリスト編集（証券コードをカンマ・改行区切りで入力）", expanded=False):
-
-        codes_text = st.text_area(
-            "証券コード一覧（4桁）",
-            height=140,
-            key="watchlist_input",
-            placeholder="例：7203,8306,9432\n気になる銘柄の証券コードを入力してください",
-            help="カンマ・改行・スペース区切りで入力。編集内容は即座にスキャン対象に反映されます",
-        )
+    with st.expander("➕ 銘柄を検索してウォッチリストに追加", expanded=False):
 
         # 銘柄検索して追加
-        st.markdown("**🔍 銘柄を検索してウォッチリストに追加**")
         sc1, sc2 = st.columns([3, 1])
         with sc1:
             search_query = st.text_input("銘柄コード or 会社名", key="search_query_pub",
@@ -1079,12 +1191,14 @@ EPS＝1株あたり利益。会社が「1株あたりいくら稼いだか」。
                 st.warning("銘柄が見つかりませんでした")
 
         # 検索結果はセッションに保持（追加ボタンのrerunで消えないように）
+        _existing = _wl_codes()
         for item in st.session_state.get('search_results_pub', [])[:5]:
             c, n = item['code'], item['name']
-            existing = re.findall(r'\d{3}[0-9A-Z]', codes_text.upper())
-            if c not in existing:
+            if c not in _existing:
                 if st.button(f"➕ {c} {n[:20]} をウォッチリストに追加", key=f"add_search_{c}"):
-                    st.session_state['_pending_watchlist'] = codes_text.rstrip() + f"\n{c}"
+                    _set_wl_codes(_existing + [c])
+                    # 名前をキャッシュに即反映（再取得を省く）
+                    _wl_name_cache()[c] = n
                     st.session_state['search_results_pub'] = []
                     st.rerun()
             else:
@@ -1092,19 +1206,19 @@ EPS＝1株あたり利益。会社が「1株あたりいくら稼いだか」。
 
         st.download_button(
             "📥 ウォッチリストをダウンロード",
-            data=codes_text.encode('utf-8'),
+            data=",".join(_wl_codes()).encode('utf-8'),
             file_name="watchlist.txt",
             mime="text/plain",
-            help="次回このテキストを貼り付ければウォッチリストを復元できます",
+            help="バックアップ用。証券コードのカンマ区切りで保存されます",
         )
 
     # ── 予算シミュレーション（単元未満株・少額投資向け） ──────
     with st.expander("💰 予算シミュレーション（この予算で何株買える？）", expanded=False):
-        st.caption("予算を入れると、その銘柄を**1株単位**で何株買えるか・年間いくら配当がもらえるかを計算します（単元未満株前提）。")
+        st.caption("銘柄コード（例：8591）または会社名（例：オリックス）と予算を入れると「何株買えるか・年間いくら配当がもらえるか」を計算します（単元未満株前提）。")
         sim_c1, sim_c2, sim_c3 = st.columns([2, 2, 1])
         with sim_c1:
-            sim_code = st.text_input("銘柄コード", key="sim_code_pub",
-                                     placeholder="例：8591")
+            sim_input = st.text_input("銘柄コードまたは会社名", key="sim_code_pub",
+                                      placeholder="例：8591 または オリックス")
         with sim_c2:
             sim_budget = st.number_input("予算（円）", min_value=1000, max_value=10_000_000,
                                          value=30000, step=1000, key="sim_budget_pub")
@@ -1112,35 +1226,65 @@ EPS＝1株あたり利益。会社が「1株あたりいくら稼いだか」。
             st.markdown("<br>", unsafe_allow_html=True)
             sim_go = st.button("🧮 計算", key="sim_go_pub")
 
-        if sim_go and sim_code.strip():
-            code = re.sub(r'[^0-9A-Za-z]', '', sim_code).upper()
-            if not re.fullmatch(r'\d{3}[0-9A-Z]', code):
-                st.warning("証券コードは4桁（例：8591、285A）で入力してください")
+        def _normalize(s: str) -> str:
+            return unicodedata.normalize('NFKC', s.strip())
+
+        def _run_sim_calc(code: str, budget: float) -> None:
+            with st.spinner("株価・配当を取得中…"):
+                kb   = get_price_yield_from_kabutan(code)
+                info = get_company_info(code)
+            price         = kb.get('price', 0) or 0
+            div_per_share = kb.get('dividend', 0) or 0
+            yld           = kb.get('yield_pct', 0) or 0
+            name          = info.get('company_name', code)
+            if price <= 0:
+                st.error("株価を取得できませんでした。コードを確認してください。")
+                return
+            shares = int(budget // price)
+            if shares < 1:
+                st.warning(f"**{name}** は1株 ¥{price:,.0f}。予算 ¥{budget:,.0f} では1株も買えません。予算を増やすか、他の銘柄を検討してね。")
+                return
+            invest     = shares * price
+            annual_div = shares * div_per_share
+            left       = budget - invest
+            st.markdown(f"#### {name}（{code}）")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("株価",         f"¥{price:,.0f}")
+            m2.metric("買える株数",    f"{shares:,}株", help="単元未満株なら1株から購入可能")
+            m3.metric("投資額",        f"¥{invest:,.0f}", f"残り¥{left:,.0f}")
+            m4.metric("年間配当（予）", f"¥{annual_div:,.0f}", f"利回り{yld:.2f}%")
+            st.caption(f"💡 {shares}株を持つと、1年で約 **¥{annual_div:,.0f}** の配当がもらえる計算だよ（税引前）。")
+
+        if sim_go and sim_input.strip():
+            norm = _normalize(sim_input)
+            clean = re.sub(r'[^0-9A-Za-z]', '', norm).upper()
+            if re.fullmatch(r'\d{3}[0-9A-Z]', clean):
+                # 4桁コード直接入力
+                st.session_state.pop('_sim_candidates', None)
+                _run_sim_calc(clean, sim_budget)
             else:
-                with st.spinner("株価・配当を取得中…"):
-                    kb = get_price_yield_from_kabutan(code)
-                    info = get_company_info(code)
-                price = kb.get('price', 0) or 0
-                div_per_share = kb.get('dividend', 0) or 0
-                yld = kb.get('yield_pct', 0) or 0
-                name = info.get('company_name', code)
-                if price <= 0:
-                    st.error("株価を取得できませんでした。コードを確認してください。")
-                else:
-                    shares = int(sim_budget // price)
-                    if shares < 1:
-                        st.warning(f"**{name}** は1株 ¥{price:,.0f}。予算 ¥{sim_budget:,.0f} では1株も買えません。予算を増やすか、他の銘柄を検討してね。")
-                    else:
-                        invest = shares * price
-                        annual_div = shares * div_per_share
-                        left = sim_budget - invest
-                        st.markdown(f"#### {name}（{code}）")
-                        m1, m2, m3, m4 = st.columns(4)
-                        m1.metric("株価", f"¥{price:,.0f}")
-                        m2.metric("買える株数", f"{shares:,}株", help="単元未満株なら1株から購入可能")
-                        m3.metric("投資額", f"¥{invest:,.0f}", f"残り¥{left:,.0f}")
-                        m4.metric("年間配当（予）", f"¥{annual_div:,.0f}", f"利回り{yld:.2f}%")
-                        st.caption(f"💡 {shares}株を持つと、1年で約 **¥{annual_div:,.0f}** の配当がもらえる計算だよ（税引前）。")
+                # 会社名検索
+                with st.spinner(f"「{norm}」を検索中…"):
+                    cands = search_code(norm)
+                st.session_state['_sim_candidates'] = cands
+                st.session_state['_sim_budget'] = sim_budget
+                if not cands:
+                    st.error("候補が見つかりませんでした。銘柄コード（4桁）で直接入力してみてください。")
+
+        # 候補選択UI（前回の検索結果を維持）
+        cands = st.session_state.get('_sim_candidates')
+        if cands is not None:
+            if len(cands) == 1:
+                st.info(f"✅ 「{cands[0]['code']} {cands[0]['name']}」で計算します。")
+                _run_sim_calc(cands[0]['code'], st.session_state.get('_sim_budget', sim_budget))
+                st.session_state.pop('_sim_candidates', None)
+            elif len(cands) > 1:
+                st.markdown(f"**{len(cands)}件の候補が見つかりました。選んでください：**")
+                options = {f"{c['code']}　{c['name']}": c['code'] for c in cands[:10]}
+                selected_label = st.radio("銘柄を選択", list(options.keys()), key="sim_radio_pub")
+                if st.button("✓ この銘柄で計算", key="sim_select_go_pub"):
+                    _run_sim_calc(options[selected_label], st.session_state.get('_sim_budget', sim_budget))
+                    st.session_state.pop('_sim_candidates', None)
 
     # ── ポートフォリオバランスから候補を自動追加 ─────────────
     portfolio_df: pd.DataFrame | None = st.session_state.get('portfolio_df')
@@ -1265,10 +1409,29 @@ EPS＝1株あたり利益。会社が「1株あたりいくら稼いだか」。
     # ── スキャン実行 ──────────────────────────────────────
     _wl_text = st.session_state.get('watchlist_input', _DEFAULT_WATCHLIST)
     _persist("haitou_wl", _wl_text)   # ウォッチリストをブラウザに自動保存
-    raw_codes = re.findall(r'\d{3}[0-9A-Z]', _wl_text.upper())
-    unique_codes = list(dict.fromkeys(raw_codes))
+    unique_codes = _wl_codes()
 
-    st.markdown(f"**ウォッチリスト：{len(unique_codes)} 銘柄**")
+    st.markdown(f"**📋 ウォッチリスト：{len(unique_codes)} 銘柄**")
+
+    # ── ウォッチリスト・バッジ（コード＋会社名・タップで削除）──────────
+    if unique_codes:
+        # 会社名を取得＆キャッシュ（初回のみ通信・以降は即時）
+        name_cache = ensure_wl_names(unique_codes)
+        st.caption("🗑️ バッジを押すとウォッチリストから削除できます")
+        # 1行5列でバッジ風ボタンを並べる
+        n_cols = 5
+        for row_start in range(0, len(unique_codes), n_cols):
+            row_codes = unique_codes[row_start:row_start + n_cols]
+            cols = st.columns(n_cols)
+            for i, code in enumerate(row_codes):
+                name  = name_cache.get(code, '')
+                label = f"{code} {name[:8]}" if name else f"{code}"
+                if cols[i].button(label, key=f"del_wl_{code}",
+                                  help="クリックで削除", use_container_width=True):
+                    _set_wl_codes([c for c in unique_codes if c != code])
+                    st.rerun()
+    else:
+        st.info("まだ銘柄がありません。上の「➕ 銘柄を検索してウォッチリストに追加」から追加してね。")
 
     scan_col1, scan_col2 = st.columns([2, 8])
     with scan_col1:
@@ -1444,76 +1607,137 @@ obs.observe(window.parent.document.body, {{ childList: true, subtree: true }});
 
 
 # ═══════════════════════════════════════════════════════
-#  配当金カレンダー（保有銘柄が何月に権利確定するか）
+#  配当金カレンダータブ（保有銘柄が何月に権利確定するか）
 # ═══════════════════════════════════════════════════════
-def render_dividend_calendar(df) -> None:
-    st.markdown("### 📅 配当金カレンダー")
-
-    if df is None or df.empty:
-        st.info("ポートフォリオを読み込むと、保有銘柄が「何月に配当の権利が確定するか」を一覧表示できます")
-        return
-
-    st.caption("「📅 カレンダーを生成」を押すと、保有銘柄の決算月を調べて配当の権利確定月を表にします（1銘柄あたり約1秒）。")
-    if st.button("📅 カレンダーを生成", key="gen_caldr_pub"):
-        cache = st.session_state.setdefault('_fiscal_month', {})
-        codes = df['code'].tolist()
-        prog = st.progress(0, text="決算月を取得中…")
-        for i, code in enumerate(codes):
-            prog.progress((i + 1) / len(codes), text=f"{code} の決算月を取得中…")
-            if code not in cache:
-                try:
-                    results = get_results(code)
-                    fm = None
-                    for r in reversed(results):
-                        m = re.search(r'/(\d{2})', str(r.get('year', '')))
-                        if m:
-                            fm = int(m.group(1))
-                            break
-                    cache[code] = fm
-                except Exception:
-                    cache[code] = None
-        prog.empty()
-        st.session_state['_caldr_done'] = True
-
-    if not st.session_state.get('_caldr_done'):
-        return
-
-    cache = st.session_state.get('_fiscal_month', {})
-    months = {m: [] for m in range(1, 13)}   # 月 → [(銘柄名, 配当目安), ...]
+def _build_calendar_data(df: pd.DataFrame, cache: dict) -> tuple[list, list]:
+    """キャッシュとポートフォリオDFから月別集計データを作る。
+    Returns: (months_data, unknown_names)
+      months_data: list of dict {month, total, names_list, amounts_list}
+    """
+    months: dict[int, list[tuple[str, float]]] = {m: [] for m in range(1, 13)}
     unknown = []
     for _, row in df.iterrows():
         fm = cache.get(row['code'])
         annual = row.get('annual_dividend', 0) or 0
-        name = str(row.get('name', ''))[:10]
+        name = str(row.get('name', ''))[:12]
         if not fm:
             if annual > 0:
                 unknown.append(name)
             continue
         if annual <= 0:
             continue
-        interim = (fm + 6 - 1) % 12 + 1   # 期末の6ヶ月前 ≒ 中間
+        interim = (fm + 6 - 1) % 12 + 1
         half = annual / 2
-        months[fm].append((name, half))        # 期末
-        months[interim].append((name, half))    # 中間
+        months[fm].append((name, half))
+        months[interim].append((name, half))
 
-    rows = []
+    result = []
     for m in range(1, 13):
         items = months[m]
-        total = sum(a for _, a in items)
-        names = "、".join(n for n, _ in items)
-        rows.append({
-            '月':            f"{m}月",
-            '権利確定する銘柄': names or '—',
-            '配当の目安':     f"¥{total:,.0f}" if total else '—',
+        result.append({
+            'month': m,
+            'total': sum(a for _, a in items),
+            'names': [n for n, _ in items],
+            'amounts': [a for _, a in items],
         })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    return result, unknown
+
+
+def _render_calendar_chart(df: pd.DataFrame, cache: dict) -> None:
+    """配当カレンダーを棒グラフで描画する。"""
+    data, unknown = _build_calendar_data(df, cache)
+
+    # 年間合計サマリー
+    annual_total = sum(d['total'] for d in data)
+    avg_monthly  = annual_total / 12 if annual_total > 0 else 0
+
+    ks1, ks2 = st.columns(2)
+    ks1.metric("年間配当合計（概算）", f"¥{annual_total:,.0f}")
+    ks2.metric("月平均受取",           f"¥{avg_monthly:,.0f}")
+
+    month_labels = [f"{d['month']}月" for d in data]
+    totals = [d['total'] for d in data]
+    hover_texts = []
+    for d in data:
+        if d['names']:
+            lines = [f"{n}：¥{a:,.0f}" for n, a in zip(d['names'], d['amounts'])]
+            hover_texts.append("<br>".join(lines))
+        else:
+            hover_texts.append("権利確定なし")
+
+    fig = go.Figure(go.Bar(
+        x=month_labels,
+        y=totals,
+        text=[f"¥{v:,.0f}" if v > 0 else "" for v in totals],
+        textposition="outside",
+        marker_color=["#2e8b57" if v > 0 else "#dddddd" for v in totals],
+        hovertext=hover_texts,
+        hovertemplate="<b>%{x}</b><br>合計：¥%{y:,.0f}<br><br>%{hovertext}<extra></extra>",
+    ))
+    fig.update_layout(
+        title="月別 配当受取予定（権利確定月ベース）",
+        xaxis_title="権利確定月",
+        yaxis_title="配当金合計（円）",
+        yaxis=dict(rangemode="tozero"),
+        height=420,
+        margin=dict(t=60, b=40, l=60, r=20),
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
     st.caption(
         "※ **権利確定月**＝その月末まで株を持っていれば配当の権利がもらえる月の目安。"
-        "実際の受取はその約2〜3ヶ月後です。中間・期末で半額ずつ配当が出ると仮定した概算で、"
-        "実際の配当月・金額は銘柄により異なります。正確な情報は各社のIRで確認してください。"
+        "実際の受取はその約2〜3ヶ月後。中間・期末で半額ずつ出ると仮定した概算です。"
+        "棒グラフにカーソルを合わせると銘柄の内訳が表示されます。"
     )
     if unknown:
-        st.caption(f"⚠️ 決算月を取得できなかった銘柄：{('、'.join(unknown))}")
+        st.caption(f"⚠️ 決算月を取得できなかった銘柄：{'、'.join(unknown)}")
+
+
+def render_calendar_tab() -> None:
+    st.subheader("📅 配当金カレンダー")
+
+    df: pd.DataFrame | None = st.session_state.get('portfolio_df')
+    if df is None or df.empty:
+        st.info("ポートフォリオタブでCSVを読み込むと、配当カレンダーが使えます")
+        return
+
+    cache: dict = st.session_state.get('_fiscal_month', {})
+    codes = df['code'].tolist()
+    all_fetched = all(c in cache for c in codes)
+
+    if all_fetched:
+        # 既に取得済み → ボタンなしで自動表示
+        col_refresh, _ = st.columns([2, 5])
+        with col_refresh:
+            if st.button("🔄 再取得（銘柄が変わった場合）", key="caldr_refresh"):
+                st.session_state.pop('_fiscal_month', None)
+                st.rerun()
+        _render_calendar_chart(df, cache)
+    else:
+        # 初回 or 未取得銘柄あり
+        missing = [c for c in codes if c not in cache]
+        st.caption(f"{'初めての' if not cache else '新銘柄の'}決算月データを取得します（{len(missing)}銘柄 × 約1秒）。取得後は自動保存され、次回から即表示されます。")
+        if st.button("📅 カレンダーを生成", key="gen_caldr_pub"):
+            prog = st.progress(0, text="決算月を取得中…")
+            for i, code in enumerate(codes):
+                prog.progress((i + 1) / len(codes), text=f"{code} の決算月を取得中… ({i+1}/{len(codes)})")
+                if code not in cache:
+                    try:
+                        results = get_results(code)
+                        fm = None
+                        for r in reversed(results):
+                            m_match = re.search(r'/(\d{2})', str(r.get('year', '')))
+                            if m_match:
+                                fm = int(m_match.group(1))
+                                break
+                        cache[code] = fm
+                    except Exception:
+                        cache[code] = None
+            prog.empty()
+            st.session_state['_fiscal_month'] = cache
+            _persist("haitou_calendar", json.dumps(cache))
+            st.rerun()
 
 
 # ═══════════════════════════════════════════════════════
@@ -1582,11 +1806,6 @@ def render_report_tab() -> None:
 
     st.divider()
 
-    # ── Section 1.5: 配当金カレンダー ────────────────────
-    render_dividend_calendar(df)
-
-    st.divider()
-
     # ── Section 2: 購入候補トップ10 ──────────────────────
     st.markdown("### 🏆 購入候補トップ10")
 
@@ -1642,10 +1861,6 @@ def render_report_tab() -> None:
         _goal        = get_goal()
         remaining    = max(0, _goal - num_owned)
 
-        month        = datetime.now().month
-        bonus_months = {6, 7, 12, 1}
-        near_bonus   = month in bonus_months
-
         type_div     = df[df['annual_dividend'] > 0].groupby('sector_type')['annual_dividend'].sum() if 'sector_type' in df.columns else pd.Series()
         total_div    = type_div.sum()
         cyc_ratio    = type_div.get('景気敏感', 0) / total_div * 100 if total_div > 0 else 0
@@ -1659,13 +1874,6 @@ def render_report_tab() -> None:
         ][:3]
 
         timing_msgs = []
-        if near_bonus:
-            timing_msgs.append(f"🎉 **ボーナス月（{month}月）**です！購入の好機です。")
-        else:
-            next_b = min((b for b in bonus_months if b > month), default=min(bonus_months))
-            diff   = (next_b - month) % 12
-            timing_msgs.append(f"📆 次のボーナス月まで約 **{diff}ヶ月**（{next_b}月）")
-
         if remaining <= 0:
             timing_msgs.append(f"🎯 目標{_goal}銘柄に達しています。定期的な見直し（入れ替え）を検討しましょう。")
         elif remaining <= 5:
@@ -1694,6 +1902,34 @@ def render_report_tab() -> None:
 
 
 # ═══════════════════════════════════════════════════════
+#  財務分析タブ（個別銘柄分析ツールへのリンク＋銘柄検索）
+# ═══════════════════════════════════════════════════════
+def render_kouapp_tab() -> None:
+    st.subheader("🔬 財務分析")
+    st.markdown("""
+気になる銘柄の**財務データ・配当履歴・連続増配年数・EPSトレンド**などを
+まとめて確認できる分析ツールです。銘柄の検索はツール内で行えます。
+
+| 機能 | 内容 |
+|---|---|
+| 📈 財務分析 | 売上・純利益・EPSの推移をグラフで確認 |
+| 💰 配当履歴 | 過去の配当金推移・連続増配チェック |
+| 📊 スコアリング | 100点満点でランク判定（S/A/B/C） |
+| 🏭 業種・セクター | 景気タイプ別の位置づけを確認 |
+    """)
+
+    if _KOUAPP_URL:
+        st.markdown(
+            f'<div style="margin-top:24px;">'
+            f'<a href="{_KOUAPP_URL}" target="_blank" '
+            f'style="background:#1a6b9e; color:white; padding:12px 32px; '
+            f'border-radius:8px; font-size:1.1rem; text-decoration:none; font-weight:bold;">'
+            f'🚀 財務分析ツールを開く</a></div>',
+            unsafe_allow_html=True,
+        )
+
+
+# ═══════════════════════════════════════════════════════
 #  使い方タブ（取扱説明書）
 # ═══════════════════════════════════════════════════════
 def render_manual_tab() -> None:
@@ -1707,6 +1943,8 @@ def render_manual_tab() -> None:
 | 📊 ポートフォリオ | 保有株のCSVを読み込んで、配当・セクターバランスを自動分析 |
 | 🔍 スクリーニング | 気になる銘柄を100点満点でスコアリングして、買い候補をランク付け |
 | 📋 月次レポート | ポートフォリオの現状と購入候補トップ10をまとめて表示 |
+| 📅 配当カレンダー | 保有銘柄が何月に配当の権利確定するかを棒グラフで表示 |
+| 🔬 財務分析 | 個別銘柄の財務データ・配当履歴を専用ツールで詳しく確認 |
 
 ---
 
@@ -1734,9 +1972,10 @@ def render_manual_tab() -> None:
 ### 🔍 スクリーニングの使い方
 
 1. 「🔍 購入候補スクリーニング」タブを開く
-2. **ウォッチリスト**に気になる銘柄の証券コード（4桁）を入力
-   - 会社名で検索して追加もできる
+2. **ウォッチリスト**に気になる銘柄を追加する
+   - 「➕ 銘柄を検索してウォッチリストに追加」を開いて、**証券コード（4桁）または会社名**で検索 → 候補の「➕ 追加」ボタンで登録
    - ポートフォリオ読込済みなら「🤖 自動追加」で不足セクターから候補を自動提案
+   - 登録した銘柄は **コード＋会社名のバッジ**で一覧表示される（**バッジを押すと削除**）
 3. **「▶️ スキャン実行」** を押す（1銘柄あたり約3秒）
 4. 結果がスコア順に表示される
 
@@ -1773,7 +2012,7 @@ def render_manual_tab() -> None:
 | データ | 保存方法 | 復元方法 |
 |---|---|---|
 | 保有銘柄 | 「💾 保有データを保存（CSV）」でダウンロード | 別端末でそのCSVをアップロード |
-| ウォッチリスト | 「📥 ウォッチリストをダウンロード」 | 中身をコピーして貼り付け |
+| ウォッチリスト | 同じブラウザなら自動保存・自動復元（バックアップは「📥 ウォッチリストをダウンロード」） | 別端末では検索から再登録 |
 | 配点設定 | URLをブックマーク | ブックマークから開く |
 
 ### 🎯 目標銘柄数を変える
@@ -1786,7 +2025,18 @@ def render_manual_tab() -> None:
 
 ### 📅 配当金カレンダー
 
-月次レポートタブの「📅 配当金カレンダー」で、保有銘柄が**何月に配当の権利が確定するか**を一覧で見られます。配当がもらえる月を楽しみに待てます。
+「📅 配当カレンダー」タブで、保有銘柄が**何月に配当の権利が確定するか**を棒グラフで見られます。棒にカーソルを合わせると銘柄ごとの内訳が表示され、年間合計・月平均も分かります。配当がもらえる月を楽しみに待てます（初回だけ決算月の取得に少し時間がかかり、以降は自動で記憶されます）。
+
+### 🔬 財務分析
+
+「🔬 財務分析」タブの **「🚀 財務分析ツールを開く」** ボタンから、個別銘柄の詳しい分析ツール（別アプリ）を開けます。できること：
+
+- **財務分析**：売上・純利益・EPSの推移をグラフで確認
+- **配当履歴**：過去の配当金推移・連続増配年数をチェック
+- **スコアリング**：100点満点でランク判定（S/A/B/C）
+- **比較分析**：2〜5社を並べて同セクター内で比較
+
+銘柄の検索はツールを開いた先で行います。気になる銘柄を買う前の「最終チェック」に使ってね。
 
 ---
 
@@ -1830,31 +2080,41 @@ def main():
     _restore_persisted()
 
     # ── タイトルエリア（ロゴ／テキスト／キャラクター）──
-    col_logo, col_title, col_illust = st.columns([1, 8, 2])
+    col_logo, col_title, col_illust = st.columns([3, 7, 2])
     with col_logo:
         if _icon_path.exists():
-            st.image(str(_icon_path), width=56)
+            st.image(str(_icon_path), width=200)
     with col_title:
-        st.markdown("## 🌳 配当の森 〜育てる高配当株ダッシュボード〜")
+        st.markdown("## 金の卵を産む鶏 〜育てる高配当株ダッシュボード〜")
         st.caption(
-            "1銘柄ずつコツコツ植えて、配当をすくすく育てる。 "
+            "高配当株という金の卵を産む鶏を、コツコツ育てる。 "
             "データはこのブラウザセッション内のみで処理され、サーバーには保存されません。"
         )
     with col_illust:
-        st.markdown(
-            '<div style="text-align:right; margin-bottom:6px;">'
+        _btn = (
+            '<div style="text-align:right; margin-bottom:6px; display:flex; flex-wrap:wrap; gap:6px; justify-content:flex-end;">'
             '<a href="https://www.rakuten-sec.co.jp/" target="_blank" '
-            'style="background:#bf0000; color:white; padding:6px 12px; '
-            'border-radius:6px; font-size:13px; text-decoration:none; font-weight:bold;">'
-            '🏦 楽天証券</a></div>',
-            unsafe_allow_html=True,
+            'style="background:#bf0000; color:white; padding:5px 10px; '
+            'border-radius:6px; font-size:12px; text-decoration:none; font-weight:bold; white-space:nowrap;">'
+            '🏦 楽天証券</a>'
+            '<a href="https://irbank.net/" target="_blank" '
+            'style="background:#1a6b9e; color:white; padding:5px 10px; '
+            'border-radius:6px; font-size:12px; text-decoration:none; font-weight:bold; white-space:nowrap;">'
+            '📊 IRバンク</a>'
+            '<a href="https://kabutan.jp/" target="_blank" '
+            'style="background:#2e8b57; color:white; padding:5px 10px; '
+            'border-radius:6px; font-size:12px; text-decoration:none; font-weight:bold; white-space:nowrap;">'
+            '📈 株探</a>'
+            '</div>'
         )
+        st.markdown(_btn, unsafe_allow_html=True)
         if _illust_path.exists():
             st.image(str(_illust_path), width=220)
-            st.caption("by 秘書コウ ｜ データソース：IRバンク")
+            st.caption("by 秘書コウ ｜ データソース：IRバンク・株探")
 
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "📊 ポートフォリオ", "🔍 購入候補スクリーニング", "📋 月次レポート", "📘 使い方",
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "📊 ポートフォリオ", "🔍 購入候補スクリーニング", "📋 月次レポート",
+        "📅 配当カレンダー", "🔬 財務分析", "📘 使い方",
     ])
 
     with tab1:
@@ -1867,6 +2127,12 @@ def main():
         render_report_tab()
 
     with tab4:
+        render_calendar_tab()
+
+    with tab5:
+        render_kouapp_tab()
+
+    with tab6:
         render_manual_tab()
 
 
