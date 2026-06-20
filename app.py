@@ -57,7 +57,14 @@ from scraper import (
     get_company_info, search_code, get_results,
     get_price_yield_from_kabutan,
     get_category_stocks_kabutan, KABUTAN_INDUSTRY_NUM,
+    check_irbank_status,
 )
+
+
+@st.cache_data(ttl=600)
+def _cached_irbank_blocked() -> bool:
+    """IRBankのブロック有無を10分キャッシュ（コンテナ全体で共有・頻繁な再チェックを避ける）。"""
+    return check_irbank_status()
 
 # ── セクタータイプ色定義 ──────────────────────────────────
 SECTOR_TYPE_COLOR = {
@@ -2111,6 +2118,12 @@ def main():
         if _illust_path.exists():
             st.image(str(_illust_path), width=220)
             st.caption("by 秘書コウ ｜ データソース：IRバンク・株探")
+
+    if _cached_irbank_blocked():
+        st.warning(
+            "⚠️ 現在IRバンクが混み合っているため、一部データを株探で代替表示しています。"
+            "配当履歴が短く見える場合がありますが、時間をおいて再度お試しください。"
+        )
 
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "📊 ポートフォリオ", "🔍 購入候補スクリーニング", "📋 月次レポート",
