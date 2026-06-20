@@ -86,6 +86,24 @@ def _get(url: str) -> BeautifulSoup | None:
         return None
 
 
+IRBANK_BLOCKED: bool | None = None   # None=未チェック, True=ブロック中, False=正常
+
+
+def check_irbank_status() -> bool:
+    """IRBankが現在ブロックされているか軽量チェックする（クラウドIP次第で当たり外れがある）。
+    判定結果はIRBANK_BLOCKEDにキャッシュし、各取得関数が無駄なIRBankリクエストを
+    スキップして直接株探に行けるようにする。
+    """
+    global IRBANK_BLOCKED
+    soup = _get(f"{BASE_URL}/7203")   # トヨタ自動車で軽量チェック
+    if soup is None:
+        IRBANK_BLOCKED = True
+        return True
+    title = soup.title.get_text(strip=True) if soup.title else ""
+    IRBANK_BLOCKED = "7203" not in title
+    return IRBANK_BLOCKED
+
+
 def get_sector(code: str) -> dict:
     """株探から業種分類を取得する（Yahoo Finance profileが使用不可のため）。"""
 
@@ -273,7 +291,10 @@ def search_code(query: str) -> list[dict]:
 def get_company_info(code: str) -> dict:
     """企業名・株価・各種指標を取得する。
     IRBank → 株探の順でフォールバック（クラウド環境対応）。
+    IRBANK_BLOCKEDが判定済みでブロック中なら、IRBankへのリクエスト自体をスキップする。
     """
+    if IRBANK_BLOCKED:
+        return get_company_info_kabutan(code)
     soup = _get(f"{BASE_URL}/{code}")
     if soup is None:
         return get_company_info_kabutan(code)
@@ -366,7 +387,10 @@ def get_company_info(code: str) -> dict:
 def get_results(code: str) -> list[dict]:
     """売上高・営業利益・純利益・EPSの年次推移（最大15年）を取得する。
     IRBank → 株探の順でフォールバック（クラウド環境対応）。
+    IRBANK_BLOCKEDが判定済みでブロック中なら、IRBankへのリクエスト自体をスキップする。
     """
+    if IRBANK_BLOCKED:
+        return get_results_kabutan(code)
     soup = _get(f"{BASE_URL}/{code}/results")
     if soup is None:
         return get_results_kabutan(code)
@@ -441,7 +465,10 @@ def get_results(code: str) -> list[dict]:
 def get_dividends_from_results(code: str) -> list[dict]:
     """業績ページの一株配当列から配当金推移を取得する（株式分割調整済み）。
     IRBank → 株探の順でフォールバック（クラウド環境対応）。
+    IRBANK_BLOCKEDが判定済みでブロック中なら、IRBankへのリクエスト自体をスキップする。
     """
+    if IRBANK_BLOCKED:
+        return get_dividends_from_results_kabutan(code)
     soup = _get(f"{BASE_URL}/{code}/results")
     if soup is None:
         return get_dividends_from_results_kabutan(code)
