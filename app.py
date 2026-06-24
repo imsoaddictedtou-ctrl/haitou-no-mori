@@ -209,14 +209,22 @@ def get_goal() -> int:
 # ═══════════════════════════════════════════════════════
 #  CSV パーサー（楽天証券 & 独自フォーマット対応）
 # ═══════════════════════════════════════════════════════
+# CSV変換で「中身があるのに数値化できなかった」値をためておく場所
+_to_float_warnings: list[str] = []
+
+
 def _to_float(s: str) -> float:
     if not s:
-        return 0.0
-    s = str(s).strip().replace('－', '-').replace('▲', '-')
+        return 0.0                      # 空欄は素直に0（正常）
+    raw = str(s).strip()
+    s = raw.replace('－', '-').replace('▲', '-')
     s = re.sub(r'[,円%株\s]', '', s)
     try:
         return float(s)
     except ValueError:
+        # 空欄ではないのに数値化できない＝想定外。黙って0にせず記録しておく
+        if raw:
+            _to_float_warnings.append(raw)
         return 0.0
 
 
@@ -342,6 +350,7 @@ def parse_rakuten_csv(file) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = '0'
 
+    _to_float_warnings.clear()   # この読み込み分の「変換できなかった値」を集計し直す
     for col in ['shares', 'cost_price', 'current_price', 'market_value', 'profit']:
         df[col] = df[col].apply(_to_float)
 
@@ -354,6 +363,15 @@ def parse_rakuten_csv(file) -> pd.DataFrame:
 
     if 'account' not in df.columns or df['account'].eq('0').all():
         df['account'] = '不明'
+
+    if _to_float_warnings:
+        _bad = list(dict.fromkeys(_to_float_warnings))[:10]   # 重複除き最大10件
+        st.warning(
+            "⚠️ CSVの一部の値を数値として読み取れず、0として扱いました"
+            "（合計や利回りがずれる可能性があります）。該当値の例： "
+            + " / ".join(_bad)
+        )
+        _to_float_warnings.clear()
 
     keep = ['code', 'name', 'account', 'shares', 'cost_price', 'purchase_value',
             'current_price', 'market_value', 'profit', 'profit_pct']
