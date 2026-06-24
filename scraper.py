@@ -104,9 +104,16 @@ def check_irbank_status() -> bool:
     return IRBANK_BLOCKED
 
 
+def _safe_code(code: str) -> str:
+    """銘柄コードを英数字だけに正規化する（URLに変な文字を混ぜない／パストラバーサル防止）。
+    日本の証券コードは数字4桁または英数字4桁（例: 7203, 285A）。"""
+    return re.sub(r'[^0-9A-Za-z]', '', str(code or '')).upper()[:8]
+
+
 def get_sector(code: str) -> dict:
     """株探から業種分類を取得する（Yahoo Finance profileが使用不可のため）。"""
 
+    code = _safe_code(code)
     sector = "不明"
 
     # 有効な業種名のセット（誤検出フィルタ用）
@@ -184,6 +191,7 @@ def get_dividend_from_yahoo_quote(code: str) -> float:
         1口（株）あたりの予想/実績分配金・配当金（円）。取得できなければ 0.0。
     """
     # ── ① ② Yahoo Finance ─────────────────────────────────
+    code = _safe_code(code)
     soup = _get(f"https://finance.yahoo.co.jp/quote/{code}")
     if soup is not None:
         text = soup.get_text()
@@ -229,6 +237,7 @@ def get_price_yield_from_kabutan(code: str) -> dict:
         {'price': float, 'yield_pct': float, 'dividend': float}
         取得失敗時は全て 0.0。
     """
+    code = _safe_code(code)
     result = {'price': 0.0, 'yield_pct': 0.0, 'dividend': 0.0}
     soup = _get(f"https://kabutan.jp/stock/?code={code}")
     if soup is None:
@@ -293,6 +302,7 @@ def get_company_info(code: str) -> dict:
     IRBank → 株探の順でフォールバック（クラウド環境対応）。
     IRBANK_BLOCKEDが判定済みでブロック中なら、IRBankへのリクエスト自体をスキップする。
     """
+    code = _safe_code(code)
     if IRBANK_BLOCKED:
         return get_company_info_kabutan(code)
     soup = _get(f"{BASE_URL}/{code}")
@@ -389,6 +399,7 @@ def get_results(code: str) -> list[dict]:
     IRBank → 株探の順でフォールバック（クラウド環境対応）。
     IRBANK_BLOCKEDが判定済みでブロック中なら、IRBankへのリクエスト自体をスキップする。
     """
+    code = _safe_code(code)
     if IRBANK_BLOCKED:
         return get_results_kabutan(code)
     soup = _get(f"{BASE_URL}/{code}/results")
@@ -467,6 +478,7 @@ def get_dividends_from_results(code: str) -> list[dict]:
     IRBank → 株探の順でフォールバック（クラウド環境対応）。
     IRBANK_BLOCKEDが判定済みでブロック中なら、IRBankへのリクエスト自体をスキップする。
     """
+    code = _safe_code(code)
     if IRBANK_BLOCKED:
         return get_dividends_from_results_kabutan(code)
     soup = _get(f"{BASE_URL}/{code}/results")
@@ -525,6 +537,7 @@ def get_dividends_from_results(code: str) -> list[dict]:
 
 def get_dividends(code: str) -> list[dict]:
     """過去の配当金履歴を取得する。"""
+    code = _safe_code(code)
     soup = _get(f"{BASE_URL}/{code}/dividend")
     if soup is None:
         return []
@@ -589,6 +602,7 @@ def get_dividend_streak(code: str) -> dict:
         data_ok       : データが取得できたか
     """
 
+    code = _safe_code(code)
     def _parse(s: str) -> float | None:
         if not s or s in ('不明', '-', '－', '*', ''):
             return None
@@ -1026,6 +1040,7 @@ def _kabutan_finance_data(code: str) -> dict:
         {'results': [{'year','revenue','op_profit','net_profit','eps','dividend'}...],
          'equity_ratio': '61.6%' or '不明'}
     """
+    code = _safe_code(code)
     out = {'results': [], 'equity_ratio': '不明'}
     soup = _get(f"https://kabutan.jp/stock/finance?code={code}")
     if soup is None:
@@ -1083,6 +1098,7 @@ def _kabutan_finance_data(code: str) -> dict:
 
 def get_results_kabutan(code: str) -> list[dict]:
     """株探版 get_results。IRBankと同じ形式で返す。"""
+    code = _safe_code(code)
     data = _kabutan_finance_data(code)
     return [
         {k: r[k] for k in ('year', 'revenue', 'op_profit', 'net_profit', 'eps', 'roe')}
@@ -1092,6 +1108,7 @@ def get_results_kabutan(code: str) -> list[dict]:
 
 def get_dividends_from_results_kabutan(code: str) -> list[dict]:
     """株探版 配当推移。IRBankのget_dividends_from_resultsと同形式。"""
+    code = _safe_code(code)
     data = _kabutan_finance_data(code)
     return [
         {
@@ -1108,6 +1125,7 @@ def get_dividends_from_results_kabutan(code: str) -> list[dict]:
 
 def get_company_info_kabutan(code: str) -> dict:
     """株探版 get_company_info。トップページ＋決算ページの2リクエスト。"""
+    code = _safe_code(code)
     soup = _get(f"https://kabutan.jp/stock/?code={code}")
     if soup is None:
         return {'listed': False}
