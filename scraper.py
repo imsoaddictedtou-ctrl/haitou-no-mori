@@ -87,6 +87,7 @@ def _get(url: str) -> BeautifulSoup | None:
 
 
 IRBANK_BLOCKED: bool | None = None   # None=未チェック, True=ブロック中, False=正常
+KABUTAN_BLOCKED: bool | None = None  # None=未チェック, True=ブロック中, False=正常
 
 
 def check_irbank_status() -> bool:
@@ -102,6 +103,20 @@ def check_irbank_status() -> bool:
     title = soup.title.get_text(strip=True) if soup.title else ""
     IRBANK_BLOCKED = "7203" not in title
     return IRBANK_BLOCKED
+
+
+def check_kabutan_status() -> bool:
+    """株探（IRBankのフォールバック先）が現在ブロックされているか軽量チェックする。
+    これがTrueだとIRBank・株探どちらもダメで、みんかぶ頼みになっている状態。
+    """
+    global KABUTAN_BLOCKED
+    soup = _get("https://kabutan.jp/stock/?code=7203")
+    if soup is None:
+        KABUTAN_BLOCKED = True
+        return True
+    title = soup.title.get_text(strip=True) if soup.title else ""
+    KABUTAN_BLOCKED = "トヨタ" not in title
+    return KABUTAN_BLOCKED
 
 
 def _safe_code(code: str) -> str:
@@ -299,25 +314,34 @@ def search_code(query: str) -> list[dict]:
 
 def get_company_info(code: str) -> dict:
     """企業名・株価・各種指標を取得する。
-    IRBank → 株探の順でフォールバック（クラウド環境対応）。
+    IRBank → 株探 → みんかぶ の順でフォールバック（クラウド環境対応）。
     IRBANK_BLOCKEDが判定済みでブロック中なら、IRBankへのリクエスト自体をスキップする。
     """
     code = _safe_code(code)
     if IRBANK_BLOCKED:
-        return get_company_info_kabutan(code)
+        info = get_company_info_kabutan(code)
+        if info.get("listed"):
+            return info
+        return get_company_info_minkabu(code)
     soup = _get(f"{BASE_URL}/{code}")
     if soup is None:
-        return get_company_info_kabutan(code)
+        info = get_company_info_kabutan(code)
+        if info.get("listed"):
+            return info
+        return get_company_info_minkabu(code)
 
     title = soup.title.get_text(strip=True) if soup.title else ""
     if "NOT FOUND" in title or "404" in title:
         return {"listed": False}
-    # IRBankブロック時（CloudFrontエラーページ等）は株探へ
+    # IRBankブロック時（CloudFrontエラーページ等）は株探へ、それもダメならみんかぶへ
     # 正常時のタイトルは「7203 トヨタ自動車 | 株式情報」のようにコードを含む
     if code not in title:
         kabutan_info = get_company_info_kabutan(code)
         if kabutan_info.get("listed"):
             return kabutan_info
+        minkabu_info = get_company_info_minkabu(code)
+        if minkabu_info.get("listed"):
+            return minkabu_info
 
     company_name = "不明"
     if title:
@@ -1179,6 +1203,51 @@ def get_company_info_kabutan(code: str) -> dict:
     # 自己資本比率は決算ページから
     fin = _kabutan_finance_data(code)
     info['equity_ratio'] = fin['equity_ratio']
+    return info
+
+
+def get_company_info_minkabu(code: str) -> dict:
+    """みんかぶ版 get_company_info。IRBank・株探がどちらも使えない時の最終フォールバック。"""
+    code = _safe_code(code)
+    soup = _get(f"https://minkabu.jp/stock/{code}")
+    if soup is None:
+        return {'listed': False}
+
+    title = soup.title.get_text(strip=True) if soup.title else ''
+    m = re.match(r'(.+?)\s*\(', title)
+    company_name = m.group(1).strip() if m else '不明'
+    if company_name == '不明':
+        return {'listed': False}
+
+    info = {
+        'listed': True, 'company_name': company_name, 'code': code,
+        'stock_price': '不明', 'dividend_yield': '不明', 'dividend_amount': '不明',
+        'per': '不明', 'pbr': '不明', 'roe': '不明', 'eps': '不明', 'bps': '不明',
+        'equity_ratio': '不明', 'market_cap': '不明',
+    }
+
+    price_el = soup.select_one('.stock_price')
+    if price_el:
+        info['stock_price'] = price_el.get_text(strip=True)
+
+    text = soup.get_text()
+    m = re.search(r'利回り\s*([\d.]+)%', text)
+    if m:
+        info['dividend_yield'] = m.group(1) + '%'
+    m = re.search(r'PER[（(]?調整後[）)]?\s*([\d.]+)倍', text)
+    if m:
+        info['per'] = m.group(1) + '倍'
+    m = re.search(r'PBR\s*([\d.]+)倍', text)
+    if m:
+        info['pbr'] = m.group(1) + '倍'
+    m = re.search(r'時価総額\s*([\d,]+)百万円', text)
+    if m:
+        try:
+            yen = int(m.group(1).replace(',', '')) * 1_000_000
+            info['market_cap'] = f"{yen/1e12:.1f}兆" if yen >= 1e12 else f"{yen/1e8:.0f}億"
+        except ValueError:
+            pass
+
     return info
 
 
